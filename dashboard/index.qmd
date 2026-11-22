@@ -47,12 +47,13 @@ residuos   <- leer("output", "tablas", "preprocesamiento_residuos.csv")
 top_casos  <- leer("output", "tablas", "top_casos.csv")
 base_res   <- leer("output", "tablas", "linea_base_resumen.csv")
 
-# 03 - Paleta de los gráficos (rojo, verde, celeste y morado) y tema
-col_rojo   <- "#C62828"
-col_verde  <- "#2E7D32"
-col_cel    <- "#0288D1"
-col_mor    <- "#6A1B9A"
-col_normal <- "#C5CCD6"
+# 03 - paleta sobria de los gráficos (ladrillo, verde bosque, azul acero, azul marino y ocre) y tema
+col_rojo   <- "#a64444"
+col_verde  <- "#2f6b55"
+col_cel    <- "#4f7ca3"
+col_mor    <- "#1f3a5f"   # azul marino (antes morado)
+col_ocre   <- "#b08d57"
+col_normal <- "#c9d1db"
 col_anom   <- col_rojo
 fuente     <- "Inter, 'Segoe UI', system-ui, -apple-system, sans-serif"
 
@@ -402,7 +403,7 @@ et <- eval_tipo |>
 plot_ly(et, x = ~tipo, y = ~media, color = ~metodo, type = "bar",
         error_y = ~list(array = sd, color = "#5B6577"),
         colors = c("Univariado (|z| máx.)" = "#94A3B8", "GMM" = col_mor,
-                   "LOF (máx. k 10-50)" = col_cel, "Isolation Forest" = col_verde)) |>
+                   "LOF (máx. k 10-50)" = col_ocre, "Isolation Forest" = col_verde)) |>
   layout(barmode = "group", yaxis = list(title = "AUC-ROC", range = c(0.2, 1)),
          xaxis = list(title = ""), legend = list(orientation = "h", y = -0.2),
          shapes = list(list(type = "line", x0 = 0, x1 = 1, xref = "paper", y0 = 0.5, y1 = 0.5,
