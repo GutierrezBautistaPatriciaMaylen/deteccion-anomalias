@@ -1,0 +1,719 @@
+---
+title: "Detección de anomalías · Encuesta de Hogares del INE (Bolivia)"
+lang: es
+format:
+  html:
+    theme: flatly
+    css: estilo.css
+    page-layout: custom
+    title-block-style: none
+    toc: false
+    anchor-sections: false
+    embed-resources: true
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r}
+#| include: false
+# 01 - Paquetes y funciones de lectura
+library(tidyverse)
+library(here)
+library(plotly)
+library(DT)
+library(htmltools)
+
+leer <- function(...) {
+  ruta <- here(...)
+  if (file.exists(ruta)) readr::read_csv(ruta, show_col_types = FALSE) else NULL
+}
+fmt <- function(x) format(x, big.mark = ",", scientific = FALSE)
+
+# 02 - Datos de la corrida principal y de la evaluación
+RUN <- "01_limpio"
+res        <- leer("runs", RUN, "tablas", "resultados.csv")
+registro   <- leer("runs", "registro_corridas.csv")
+if (is.null(res)) stop("Faltan los resultados. Ejecuta main.R antes de generar el dashboard.")
+eval_res   <- leer("output", "tablas", "evaluacion_resumen.csv")
+eval_tipo  <- leer("output", "tablas", "evaluacion_por_tipo_replicas.csv")
+eval_conf  <- leer("output", "tablas", "evaluacion_matriz_confusion.csv")
+eval_lofk  <- leer("output", "tablas", "evaluacion_lof_k.csv")
+origen     <- leer("output", "tablas", "anomalias_origen.csv")
+coincid    <- leer("output", "tablas", "coincidencia_metodos.csv")
+por_grupo  <- leer("output", "tablas", "anomalias_por_grupo.csv")
+residuos   <- leer("output", "tablas", "preprocesamiento_residuos.csv")
+top_casos  <- leer("output", "tablas", "top_casos.csv")
+base_res   <- leer("output", "tablas", "linea_base_resumen.csv")
+
+# 03 - Paleta de los gráficos (rojo, verde, celeste y morado) y tema
+col_rojo   <- "#C62828"
+col_verde  <- "#2E7D32"
+col_cel    <- "#0288D1"
+col_mor    <- "#6A1B9A"
+col_normal <- "#C5CCD6"
+col_anom   <- col_rojo
+fuente     <- "Inter, 'Segoe UI', system-ui, -apple-system, sans-serif"
+
+tema <- function(p, h = 380) {
+  p <- p |>
+    layout(height = h,
+           font = list(family = fuente, size = 12, color = "#1F2A3C"),
+           paper_bgcolor = "rgba(0,0,0,0)", plot_bgcolor = "rgba(0,0,0,0)",
+           hoverlabel = list(font = list(family = fuente)),
+           template = list(layout = list(
+             xaxis = list(gridcolor = "#E8ECF2", zerolinecolor = "#D3DAE5", linecolor = "#D3DAE5"),
+             yaxis = list(gridcolor = "#E8ECF2", zerolinecolor = "#D3DAE5", linecolor = "#D3DAE5")))) |>
+    config(displaylogo = FALSE, modeBarButtonsToRemove = c("lasso2d", "select2d"))
+  p$height <- h
+  p
+}
+
+# 04 - Gráficos reutilizables
+grafico_dispersion <- function(flag, nombre) {
+  set.seed(1)
+  d <- tibble(x = round(res$aestudio + runif(nrow(res), -0.25, 0.25), 2),
+              y = round(res$log_ylab, 3), flag = flag)
+  plot_ly() |>
+    add_trace(data = d[!d$flag, ], x = ~x, y = ~y, type = "scattergl", mode = "markers",
+              marker = list(size = 4, color = col_normal, opacity = 0.55), name = "Normal") |>
+    add_trace(data = d[d$flag, ], x = ~x, y = ~y, type = "scattergl", mode = "markers",
+              marker = list(size = 5, color = col_anom, opacity = 0.85), name = nombre) |>
+    layout(xaxis = list(title = "Años de estudio"),
+           yaxis = list(title = "log(ingreso laboral)"))
+}
+grafico_puntaje <- function(score, tasa = 0.05) {
+  h <- hist(score, breaks = 60, plot = FALSE)
+  u <- quantile(score, 1 - tasa)
+  plot_ly() |>
+    add_bars(x = h$mids, y = h$counts, marker = list(color = col_cel),
+             name = "Personas", showlegend = FALSE) |>
+    add_trace(x = c(u, u), y = c(0, max(h$counts)), type = "scatter", mode = "lines",
+              line = list(color = col_anom, dash = "dash", width = 2), name = "Corte (5%)") |>
+    layout(xaxis = list(title = "Puntaje de anomalía"), yaxis = list(title = "Personas"))
+}
+panel_metodo <- function(flag, score, nombre) {
+  subplot(grafico_dispersion(flag, nombre), grafico_puntaje(score),
+          nrows = 1, widths = c(0.62, 0.38), margin = 0.05,
+          titleX = TRUE, titleY = TRUE) |>
+    layout(legend = list(orientation = "h", y = -0.2)) |>
+    tema(420)
+}
+
+# 05 - Piezas de la página
+tt <- function(x) cat('\n\n<h4 class="tt">', x, '</h4>\n\n', sep = "")
+nota <- function(muestra, significa) {
+  cat('\n\n::: {.nota}\n[Qué muestra]{.nota-t} ', muestra,
+      '\n\n[Qué significa]{.nota-t} ', paste0(significa, collapse = ""), '\n\n:::\n\n', sep = "")
+}
+kpi <- function(clase, titulo, valor, sub = "") {
+  sprintf('<div class="kpi %s"><div class="kpi-t">%s</div><div class="kpi-v">%s</div><div class="kpi-s">%s</div></div>',
+          clase, titulo, valor, sub)
+}
+perfil <- function(flag) {
+  sprintf("Las marcadas promedian %.1f años de estudio (el resto, %.1f) y un log-ingreso de %.2f (el resto, %.2f).",
+          mean(res$aestudio[flag], na.rm = TRUE), mean(res$aestudio[!flag], na.rm = TRUE),
+          mean(res$log_ylab[flag], na.rm = TRUE), mean(res$log_ylab[!flag], na.rm = TRUE))
+}
+principales <- c("Univariado (|z| máx.)", "GMM", "LOF (máx. k 10-50)", "Isolation Forest")
+rank_auc <- eval_res |> filter(metodo %in% principales) |> arrange(desc(auc_roc_media))
+puesto <- function(m) paste0("puesto ", match(m, rank_auc$metodo), " de ", nrow(rank_auc), " en la evaluación (AUC-ROC ",
+                              round(rank_auc$auc_roc_media[match(m, rank_auc$metodo)], 3), ").")
+```
+
+```{=html}
+<nav class="topbar">
+  <div class="topbar-in">
+    <a class="brand" href="#resumen"><span class="dot"></span>Anomalías · INE</a>
+    <div class="links">
+      <a href="#resumen">Resumen</a>
+      <a href="#metodos">Métodos</a>
+      <a href="#evaluacion">Evaluación</a>
+      <a href="#casos">Casos</a>
+      <a href="#bitacora">Bitácora</a>
+    </div>
+  </div>
+</nav>
+<noscript><style>.pagina{display:block !important}</style></noscript>
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  var paginas = Array.prototype.slice.call(document.querySelectorAll(".pagina"));
+  var enlaces = Array.prototype.slice.call(document.querySelectorAll(".topbar .links a"));
+  function reajustar() {
+    window.dispatchEvent(new Event("resize"));
+    if (window.Plotly) document.querySelectorAll(".pagina.activa .js-plotly-plot").forEach(function (g) { try { Plotly.Plots.resize(g); } catch (e) {} });
+    if (window.jQuery && jQuery.fn.dataTable) jQuery(jQuery.fn.dataTable.tables(true)).DataTable().columns.adjust();
+  }
+  function ir(id, subir) {
+    if (!document.getElementById(id) || paginas.map(function (p) { return p.id; }).indexOf(id) < 0) id = "resumen";
+    paginas.forEach(function (p) { p.classList.toggle("activa", p.id === id); });
+    enlaces.forEach(function (a) { a.classList.toggle("on", a.getAttribute("href") === "#" + id); });
+    if (subir) window.scrollTo(0, 0);
+    setTimeout(reajustar, 60); setTimeout(reajustar, 300);
+  }
+  enlaces.concat(Array.prototype.slice.call(document.querySelectorAll(".brand"))).forEach(function (a) {
+    a.addEventListener("click", function (e) {
+      e.preventDefault(); var id = a.getAttribute("href").slice(1);
+      history.replaceState(null, "", "#" + id); ir(id, true);
+    });
+  });
+  window.addEventListener("hashchange", function () { ir(location.hash.slice(1), true); });
+  document.addEventListener("shown.bs.tab", reajustar);
+  ir(location.hash.slice(1) || "resumen", false);
+});
+</script>
+```
+
+::: {#resumen .pagina .activa}
+
+```{=html}
+<header class="hero">
+  <div class="hero-in">
+    <h1>Detección de anomalías</h1>
+    <p class="metodos">IQR · Z-score · GMM · LOF · Isolation Forest</p>
+  </div>
+</header>
+```
+
+::: {.kpis}
+```{r}
+#| output: asis
+n_cons <- sum(res$votos >= 2)
+mejor <- eval_res |> filter(metodo != "Univariado (|z| máx.)") |> slice_max(auc_roc_media, n = 1, with_ties = FALSE)
+cat(kpi("k1", "Personas analizadas", fmt(nrow(res)), "ocupadas de 18 a 64 años"),
+    kpi("k2", "Anomalías de consenso", paste0(fmt(n_cons), " <small>(", round(100 * n_cons / nrow(res), 1), "%)</small>"), "marcadas por 2 o más métodos"),
+    kpi("k3", "Mejor método", mejor$metodo, paste0("AUC-ROC ", mejor$auc_roc_media)),
+    kpi("k4", "Corridas registradas", if (is.null(registro)) 0 else nrow(registro), "ejecuciones del motor"),
+    sep = "\n")
+```
+:::
+
+::: {.seccion}
+
+:::: {.fila .dos}
+::: {.tarjeta}
+```{r}
+#| output: asis
+tt("Origen de las anomalías de consenso")
+```
+
+```{r}
+o <- origen |> arrange(n)
+plot_ly(o, x = ~n, y = ~reorder(origen, n), type = "bar", orientation = "h",
+        marker = list(color = col_rojo), text = ~paste0(n, " (", porcentaje, "%)"),
+        textposition = "outside", hoverinfo = "text") |>
+  layout(xaxis = list(title = "Personas", range = c(0, max(o$n) * 1.3)),
+         yaxis = list(title = ""), margin = list(l = 230)) |>
+  tema(360)
+```
+
+```{r}
+#| output: asis
+top_o <- origen |> slice_max(n, n = 1, with_ties = FALSE)
+comb <- sum(origen$porcentaje[grepl("Combinaci", origen$origen)])
+nota("Por qué se marcó a cada persona que dos o más métodos señalan.",
+     c("El origen más común es «", top_o$origen, "» (", top_o$porcentaje, "%). ",
+       if (comb > 0) paste0("Las combinaciones raras de varias variables suman ", round(comb),
+                            "%: no se ven mirando una variable sola.") else ""))
+```
+:::
+
+::: {.tarjeta}
+```{r}
+#| output: asis
+tt("Coincidencia entre métodos (índice de Jaccard)")
+```
+
+```{r}
+m <- as.matrix(coincid[, -1]); rownames(m) <- coincid$metodo
+plot_ly(x = colnames(m), y = rownames(m), z = m, type = "heatmap",
+        colorscale = list(c(0, "white"), c(1, col_mor)), zmin = 0, zmax = 1,
+        text = round(m, 2), texttemplate = "%{text}", hoverinfo = "none") |>
+  layout(yaxis = list(autorange = "reversed")) |>
+  tema(360)
+```
+
+```{r}
+#| output: asis
+m2 <- m; diag(m2) <- NA
+i_max <- which(m2 == max(m2, na.rm = TRUE), arr.ind = TRUE)[1, ]
+i_min <- which(m2 == min(m2, na.rm = TRUE), arr.ind = TRUE)[1, ]
+nota("Qué tanto coinciden dos métodos: 1 = marcan a las mismas personas, 0 = a nadie en común.",
+     c("Los más parecidos: **", rownames(m)[i_max[1]], "** y **", colnames(m)[i_max[2]], "** (", round(max(m2, na.rm = TRUE), 2), "). ",
+       "Los que menos coinciden: **", rownames(m)[i_min[1]], "** y **", colnames(m)[i_min[2]], "** (", round(min(m2, na.rm = TRUE), 2), "). ",
+       "Es normal que difieran: cada uno mira algo distinto, por eso se usa el consenso."))
+```
+:::
+::::
+
+::: {.tarjeta .destacada}
+```{r}
+#| output: asis
+tt("Qué se hizo y qué se concluye")
+orden <- eval_res |> arrange(desc(auc_roc_media))
+cat("**Qué se hizo.** Se aplicaron cinco criterios de detección (IQR, Z-score, mezclas gaussianas, LOF e Isolation Forest) ",
+    "a ", fmt(nrow(res)), " personas ocupadas de 18 a 64 años del dataset ya preprocesado, usando edad, años de estudio, ",
+    "horas semanales e ingreso laboral (en logaritmo). Cada método marca el 5% más anómalo.\n\n", sep = "")
+cat("**Cómo se comparó.** Como no hay etiquetas reales, se inyectaron anomalías de tipo conocido (globales, contextuales y colectivas) ",
+    "y se repitió el experimento varias veces. Orden por AUC-ROC: ",
+    paste0(orden$metodo, " (", orden$auc_roc_media, ")", collapse = " > "), ".\n\n", sep = "")
+cat("**Lectura.** El ", round(origen$porcentaje[grepl("Combinaci", origen$origen)], 0),
+    "% de las anomalías de consenso son combinaciones raras que no se ven con una variable sola, ",
+    "por eso los métodos multivariados aportan frente al IQR y el Z-score. ",
+    "LOF depende fuertemente de su parámetro *k*: con valores pequeños no detecta grupos compactos de anomalías.\n", sep = "")
+```
+:::
+
+:::
+:::
+
+::: {#metodos .pagina}
+::: {.seccion}
+<div class="sec-head"><div><h2>Métodos</h2><p>Izquierda: cada punto es una persona (años de estudio frente a log-ingreso); en rojo, las que el método marca. Derecha: distribución del puntaje de anomalía y corte del 5%. Los gráficos son interactivos.</p></div></div>
+
+::: {.tarjeta}
+::: {.panel-tabset}
+### Línea base (IQR ×1.5)
+
+```{r}
+subplot(grafico_dispersion(res$base_iqr, "Atípico IQR"),
+        plot_ly(base_res, x = ~variable, y = ~n_iqr, type = "bar",
+                marker = list(color = col_mor), showlegend = FALSE) |>
+          layout(xaxis = list(title = "Variable"),
+                 yaxis = list(title = "Atípicos según IQR ×1.5")),
+        nrows = 1, widths = c(0.62, 0.38), margin = 0.05, titleX = TRUE, titleY = TRUE) |>
+  layout(legend = list(orientation = "h", y = -0.2)) |>
+  tema(420)
+```
+
+```{r}
+#| output: asis
+v_top <- base_res |> slice_max(n_iqr, n = 1, with_ties = FALSE)
+nota("Puntos rojos: personas fuera del rango normal de alguna variable. Barras: cuántos atípicos hay por variable.",
+     c("Marca **", fmt(sum(res$base_iqr, na.rm = TRUE)), "** personas (", round(100 * mean(res$base_iqr, na.rm = TRUE), 1),
+       "%), sobre todo por **", v_top$variable, "**. ", perfil(res$base_iqr),
+       " Mira cada variable por separado: no detecta combinaciones raras."))
+```
+
+### GMM (mezclas gaussianas)
+
+```{r}
+panel_metodo(res$anom_gmm, res$score_gmm, "Anomalía GMM")
+```
+
+```{r}
+#| output: asis
+nota("Rojo: el 5% de personas más improbables según un modelo de varios grupos.",
+     c("Marca **", fmt(sum(res$anom_gmm, na.rm = TRUE)), "** personas. ", perfil(res$anom_gmm),
+       " Detecta lo que se aleja de los grupos típicos de la población; ", puesto("GMM")))
+```
+
+### LOF (máx. k 10-50)
+
+```{r}
+panel_metodo(res$anom_lof, res$score_lof, "Anomalía LOF")
+```
+
+```{r}
+#| output: asis
+nota("Rojo: el 5% cuya zona es mucho menos densa que la de sus vecinos más cercanos.",
+     c("Marca **", fmt(sum(res$anom_lof, na.rm = TRUE)), "** personas. ", perfil(res$anom_lof),
+       " Depende del parámetro *k*: con valores chicos no ve grupos compactos de anomalías; ", puesto("LOF (máx. k 10-50)")))
+```
+
+### Isolation Forest
+
+```{r}
+panel_metodo(res$anom_if, res$score_if, "Anomalía IF")
+```
+
+```{r}
+#| output: asis
+nota("Rojo: el 5% que queda aislado con menos cortes aleatorios; cuanto más rara la persona, más rápido queda sola.",
+     c("Marca **", fmt(sum(res$anom_if, na.rm = TRUE)), "** personas. ", perfil(res$anom_if),
+       " No supone una forma de distribución; ", puesto("Isolation Forest")))
+```
+:::
+:::
+:::
+:::
+
+::: {#evaluacion .pagina}
+::: {.seccion}
+<div class="sec-head"><div><h2>Evaluación</h2><p>Como no hay etiquetas reales, se inyectaron anomalías de tipo conocido y se midió cuántas recupera cada método (promedio de 5 réplicas).</p></div></div>
+
+:::: {.fila .dos}
+::: {.tarjeta}
+```{r}
+#| output: asis
+tt("Métricas generales (corte del 5%)")
+```
+
+```{r}
+t <- eval_res |>
+  arrange(desc(auc_roc_media)) |>
+  transmute(Método = metodo,
+            `AUC-ROC` = sprintf("%.3f ± %.3f", auc_roc_media, auc_roc_sd),
+            `AUC-PR`  = sprintf("%.3f ± %.3f", auc_pr_media, auc_pr_sd),
+            Precisión = sprintf("%.3f", precision_media),
+            Recall    = sprintf("%.3f", recall_media),
+            F1        = sprintf("%.3f", f1_media))
+datatable(t, rownames = FALSE, options = list(dom = "t", ordering = FALSE, pageLength = 10, scrollX = TRUE),
+          class = "compact hover")
+```
+
+```{r}
+#| output: asis
+b_auc <- eval_res |> slice_max(auc_roc_media, n = 1, with_ties = FALSE)
+b_f1  <- eval_res |> slice_max(f1_media, n = 1, with_ties = FALSE)
+nota("Qué tan bien acierta cada método. AUC: 1 = perfecto, 0.5 = azar. Precisión: de lo marcado, cuánto era anomalía. Recall: de las anomalías, cuántas se encontraron.",
+     c("Gana **", b_auc$metodo, "** en AUC-ROC (", round(b_auc$auc_roc_media, 3), ") y **", b_f1$metodo, "** en F1 (", round(b_f1$f1_media, 3), ")."))
+```
+:::
+
+::: {.tarjeta}
+```{r}
+#| output: asis
+tt("Matriz de confusión promedio (corte del 5%)")
+```
+
+```{r}
+datatable(eval_conf |> rename(Método = metodo), rownames = FALSE,
+          options = list(dom = "t", ordering = FALSE, scrollX = TRUE), class = "compact hover",
+          caption = "VP: anomalías detectadas · FP: falsas alarmas · FN: anomalías no detectadas · VN: normales bien clasificados")
+```
+:::
+::::
+
+:::: {.fila .dos}
+::: {.tarjeta}
+```{r}
+#| output: asis
+tt("AUC-ROC por tipo de anomalía")
+```
+
+```{r}
+et <- eval_tipo |>
+  filter(metodo %in% principales) |>
+  group_by(metodo, tipo) |>
+  summarise(media = mean(auc_roc), sd = sd(auc_roc), .groups = "drop") |>
+  mutate(tipo = factor(tipo, levels = c("Global", "Contextual A", "Contextual B", "Colectiva")))
+plot_ly(et, x = ~tipo, y = ~media, color = ~metodo, type = "bar",
+        error_y = ~list(array = sd, color = "#5B6577"),
+        colors = c("Univariado (|z| máx.)" = "#94A3B8", "GMM" = col_mor,
+                   "LOF (máx. k 10-50)" = col_cel, "Isolation Forest" = col_verde)) |>
+  layout(barmode = "group", yaxis = list(title = "AUC-ROC", range = c(0.2, 1)),
+         xaxis = list(title = ""), legend = list(orientation = "h", y = -0.2),
+         shapes = list(list(type = "line", x0 = 0, x1 = 1, xref = "paper", y0 = 0.5, y1 = 0.5,
+                            line = list(color = "grey", dash = "dash")))) |>
+  tema(380)
+```
+
+```{r}
+#| output: asis
+mt <- et |> group_by(tipo) |> slice_max(media, n = 1, with_ties = FALSE) |> ungroup()
+peor <- et |> slice_min(media, n = 1, with_ties = FALSE)
+nota("Acierto de cada método según el tipo de anomalía inyectada. La línea punteada es el azar.",
+     c("Mejor por tipo: ", paste0(mt$tipo, " → **", mt$metodo, "** (", round(mt$media, 2), ")", collapse = " · "), ". ",
+       "Lo más difícil: **", peor$tipo, "** para **", peor$metodo, "** (", round(peor$media, 2), "). Ninguno gana en todo."))
+```
+:::
+
+::: {.tarjeta}
+```{r}
+#| output: asis
+tt("LOF: efecto del parámetro k")
+```
+
+```{r}
+lk <- eval_lofk |>
+  pivot_longer(-metodo, names_to = "tipo", values_to = "auc") |>
+  mutate(tipo = factor(tipo, levels = c("Global", "Contextual A", "Contextual B", "Colectiva")))
+plot_ly(lk, x = ~tipo, y = ~auc, color = ~metodo, type = "bar",
+        colors = colorRampPalette(c(col_cel, col_mor, col_rojo))(n_distinct(lk$metodo))) |>
+  layout(barmode = "group", yaxis = list(title = "AUC-ROC", range = c(0.2, 1)),
+         xaxis = list(title = ""), legend = list(orientation = "h", y = -0.25)) |>
+  tema(380)
+```
+
+```{r}
+#| output: asis
+colec <- lk |> filter(tipo == "Colectiva")
+nota("Cómo cambia LOF según cuántos vecinos (*k*) usa para comparar.",
+     if (nrow(colec) > 0) c("En anomalías colectivas el AUC va de **", round(min(colec$auc), 2), "** (", colec$metodo[which.min(colec$auc)],
+                            ") a **", round(max(colec$auc), 2), "** (", colec$metodo[which.max(colec$auc)],
+                            "). Un grupo compacto de anomalías solo se detecta si *k* es mayor que su tamaño.")
+     else "Un valor de *k* mayor detecta mejor los grupos compactos de anomalías.")
+```
+:::
+::::
+
+:::: {.fila .dos}
+::: {.tarjeta}
+```{r}
+#| output: asis
+tt("Curvas ROC (réplica 1)")
+```
+
+```{r}
+knitr::include_graphics(here("output", "graficos", "14_curvas_roc.png"))
+```
+
+```{r}
+#| output: asis
+nota("Cuántas anomalías se recuperan (vertical) a cambio de cuántas falsas alarmas (horizontal).",
+     "Cuanto más cerca de la esquina superior izquierda, mejor; la diagonal equivale al azar.")
+```
+:::
+
+::: {.tarjeta}
+```{r}
+#| output: asis
+tt("Anomalías inyectadas en el conjunto de prueba")
+```
+
+```{r}
+knitr::include_graphics(here("output", "graficos", "13_anomalias_inyectadas.png"))
+```
+:::
+::::
+
+::: {.tarjeta .destacada}
+```{r}
+#| output: asis
+tt("Diseño del experimento y limitaciones")
+cat("- **Diseño:** se parte de los datos reales sin los casos extremos conocidos y se inyectan 280 anomalías de cuatro tipos: *globales* (muy lejanas en tres variables), *contextuales A* (18-20 años con 20-23 años de estudio), *contextuales B* (0-1 años de estudio con ingreso muy alto) y una *colectiva* (grupo compacto de 40 personas). Se repite 5 veces con semillas distintas.\n",
+    "- **Métricas:** el AUC-ROC y el AUC-PR no dependen del umbral; precisión, recall y F1 se calculan con el corte del 5% usado en la práctica.\n",
+    "- **Limitación:** los resultados dependen de cómo se inyectaron las anomalías (tamaños y tipos). Son evidencia para estos datos y este diseño, no una ley general.\n", sep = "")
+```
+:::
+:::
+:::
+
+::: {#casos .pagina}
+::: {.seccion}
+<div class="sec-head"><div><h2>Casos y preprocesamiento</h2><p>Quiénes son las personas más anómalas y si el preprocesamiento dejó casos que siguen siendo extremos.</p></div></div>
+
+::: {.tarjeta}
+```{r}
+#| output: asis
+tt("Las 20 personas más anómalas (consenso de los tres métodos)")
+```
+
+```{r}
+tc <- top_casos |>
+  transmute(Edad = edad, `Años de estudio` = aestudio, `Horas semanales` = phrs,
+            `Ingreso (Bs)` = round(ylab, 1), Categoría = categoria_ocup_desc,
+            Área = area_desc, `Métodos que la marcan` = votos)
+datatable(tc, rownames = FALSE, class = "compact hover",
+          options = list(pageLength = 10, dom = "tip", scrollX = TRUE))
+```
+
+```{r}
+#| output: asis
+cat_top <- names(sort(table(top_casos$categoria_ocup_desc), decreasing = TRUE))[1]
+nota(paste0("Las ", nrow(top_casos), " personas que más métodos marcan a la vez."),
+     c("Trabajan una mediana de **", median(top_casos$phrs, na.rm = TRUE), " horas** a la semana, ganan **",
+       fmt(round(median(top_casos$ylab, na.rm = TRUE), 1)), " Bs** y tienen **", median(top_casos$aestudio, na.rm = TRUE),
+       " años de estudio**; la categoría más común es **", cat_top, "**. Hay que revisarlas una a una: pueden ser errores de captura o casos reales poco comunes."))
+```
+:::
+
+::: {.tarjeta}
+```{r}
+#| output: asis
+tt("Evaluación del preprocesamiento: casos tratados y su detección")
+```
+
+```{r}
+rs <- residuos |> mutate(caso = str_wrap(caso, 38))
+plot_ly(rs, x = ~porcentaje, y = ~reorder(caso, porcentaje), type = "bar", orientation = "h",
+        marker = list(color = col_verde),
+        text = ~paste0(marcados_consenso, " de ", n, " (", porcentaje, "%)"),
+        textposition = "outside", hoverinfo = "text") |>
+  layout(xaxis = list(title = "% marcado como anomalía de consenso", range = c(0, 150)),
+         yaxis = list(title = ""), margin = list(l = 260)) |>
+  tema(380)
+```
+
+```{r}
+#| output: asis
+r <- residuos
+nota("De los casos que el preprocesamiento tocó, qué porcentaje sigue marcado como anomalía.",
+     c("\n\n- **Ingreso 0 recodificado:** ", r$marcados_consenso[1], " de ", r$n[1], " se marcan. Es un cero estructural (familiar sin remuneración): conviene analizarlo aparte.\n",
+       "- **Horas ≥ 100:** ", r$marcados_consenso[2], " de ", r$n[2], " se marcan; las capadas a 168 siguen siendo extremas.\n",
+       "- **niv_ed_g = 4** y los **casos límite de años de estudio** casi no se marcan: no hay evidencia de que sean anomalías."))
+```
+:::
+
+::: {.tarjeta}
+```{r}
+#| output: asis
+tt("Porcentaje de anomalías de consenso por grupo")
+```
+
+```{r}
+pg <- function(var, titulo) {
+  d <- por_grupo |> filter(variable == var) |> arrange(porcentaje)
+  g <- round(100 * mean(res$votos >= 2), 1)
+  plot_ly(d, x = ~porcentaje, y = ~reorder(grupo, porcentaje), type = "bar", orientation = "h",
+          marker = list(color = col_cel),
+          text = ~paste0(porcentaje, "% (n=", n, ")"), textposition = "outside",
+          hoverinfo = "text") |>
+    layout(title = list(text = titulo, font = list(size = 13)),
+           xaxis = list(title = "% marcado", range = c(0, max(d$porcentaje) * 1.4)),
+           yaxis = list(title = ""),
+           shapes = list(list(type = "line", y0 = 0, y1 = 1, yref = "paper", x0 = g, x1 = g,
+                              line = list(color = col_rojo, dash = "dash", width = 2))))
+}
+subplot(pg("categoria_ocup_desc", "Categoría ocupacional"),
+        pg("niv_ed_g", "Nivel educativo (niv_ed_g)"),
+        pg("area_desc", "Área"),
+        nrows = 1, widths = c(0.45, 0.30, 0.25), margin = 0.06, titleX = TRUE) |>
+  layout(showlegend = FALSE) |>
+  tema(400)
+```
+
+```{r}
+#| output: asis
+g <- round(100 * mean(res$votos >= 2), 1)
+mx <- por_grupo |> filter(n >= 30) |> group_by(variable) |>
+  slice_max(porcentaje, n = 1, with_ties = FALSE) |> ungroup()
+etq <- c(categoria_ocup_desc = "categoría ocupacional", niv_ed_g = "nivel educativo", area_desc = "área")
+nota(paste0("Qué porcentaje de cada grupo es anomalía de consenso. La línea roja es la tasa general (", g, "%)."),
+     c("Donde más se concentran (grupos de 30 o más personas): ",
+       paste0(unname(etq[mx$variable]), " → **", mx$grupo, "** (", mx$porcentaje, "%)", collapse = " · "), "."))
+```
+:::
+:::
+:::
+
+::: {#bitacora .pagina}
+::: {.seccion}
+<div class="sec-head"><div><h2>Bitácora y corridas</h2><p>Registro de cada decisión del análisis y de cada ejecución del motor.</p></div></div>
+
+```{r}
+#| output: asis
+leer_bit <- function(ruta, etiqueta) {
+  if (!file.exists(ruta)) return(NULL)
+  readr::read_csv(ruta, col_types = readr::cols(.default = "c"), show_col_types = FALSE) |>
+    mutate(corrida = etiqueta, .before = 1)
+}
+bit <- bind_rows(
+  leer_bit(here("output", "bitacora", "bitacora.csv"), "Pipeline principal (scripts 01-07)"),
+  map_dfr(list.dirs(here("runs"), recursive = FALSE),
+          \(d) leer_bit(file.path(d, "bitacora.csv"), basename(d)))
+)
+cat('<div class="kpis kpis-3">',
+    kpi("k1", "Pasos registrados", nrow(bit), "todas las corridas"),
+    kpi("k3", "Corridas con bitácora", n_distinct(bit$corrida), "incluye el pipeline principal"),
+    kpi("k4", "Última actualización", max(bit$fecha_hora), "fecha y hora del último paso"),
+    '</div>', sep = "\n")
+```
+
+::: {.tarjeta}
+```{r}
+#| output: asis
+tt("Bitácora completa (filtrable; despliega el código y el resultado de cada paso)")
+```
+
+```{r}
+esc <- function(x) htmlEscape(ifelse(is.na(x), "", x))
+detalle <- function(x, etiqueta) {
+  paste0("<details><summary>", etiqueta, "</summary><pre style='white-space:pre-wrap;font-size:11px;max-width:520px'>",
+         esc(x), "</pre></details>")
+}
+tb <- bit |>
+  transmute(Corrida = corrida, Paso = as.integer(id_paso), Fecha = fecha_hora,
+            Tipo = tipo, Script = script, Acción = esc(accion), Justificación = esc(criterio),
+            `Filas antes` = filas_antes, `Filas después` = filas_despues,
+            `¿Modifica datos?` = modifica_datos,
+            Código = detalle(codigo, "ver código"), Resultado = detalle(resultado, "ver resultado"))
+datatable(tb, rownames = FALSE, escape = FALSE, filter = "top", class = "compact hover",
+          options = list(pageLength = 10, scrollX = TRUE, dom = "ltip",
+                         columnDefs = list(list(width = "280px", targets = c(5, 6)))))
+```
+:::
+
+<div class="sub-sec"><h3>Corridas</h3><p>Cada ejecución de <code>ejecutar_corrida()</code> guarda sus tablas, gráficos y bitácora en <code>runs/</code> y queda registrada aquí. De los datasets externos solo se publican resultados agregados.</p></div>
+
+::: {.tarjeta}
+```{r}
+#| output: asis
+tt("Registro de corridas")
+```
+
+```{r}
+if (is.null(registro)) {
+  tags$p("Aún no hay corridas registradas.")
+} else {
+  rg <- registro |>
+    transmute(Corrida = run_id, Fecha = fecha_hora, Archivo = archivo,
+              `Filas usadas` = filas_usadas, Variables = variables, log1p = log1p,
+              GMM = modelo_gmm, Consenso = consenso_2, `Segundos` = duracion_seg,
+              `MD5 del archivo` = substr(md5_archivo, 1, 10))
+  datatable(rg, rownames = FALSE, class = "compact hover",
+            options = list(pageLength = 5, dom = "tip", scrollX = TRUE))
+}
+```
+:::
+
+::: {.tarjeta}
+```{r}
+#| output: asis
+tt("Porcentaje de personas marcadas por método y corrida")
+```
+
+```{r}
+if (!is.null(registro) && nrow(registro) > 0) {
+  rc <- registro |>
+    mutate(across(c(filas_usadas, anom_iqr, anom_z, anom_gmm, anom_lof, anom_if, consenso_2), as.numeric)) |>
+    transmute(run_id, `IQR x1.5` = 100 * anom_iqr / filas_usadas, `Z-score` = 100 * anom_z / filas_usadas,
+              GMM = 100 * anom_gmm / filas_usadas, LOF = 100 * anom_lof / filas_usadas,
+              IF = 100 * anom_if / filas_usadas, `Consenso (2+)` = 100 * consenso_2 / filas_usadas) |>
+    pivot_longer(-run_id, names_to = "metodo", values_to = "pct") |>
+    mutate(metodo = factor(metodo, levels = c("IQR x1.5", "Z-score", "GMM", "LOF", "IF", "Consenso (2+)")))
+  plot_ly(rc, x = ~metodo, y = ~round(pct, 2), color = ~run_id, type = "bar",
+          colors = colorRampPalette(c(col_rojo, col_verde, col_cel, col_mor))(n_distinct(rc$run_id))) |>
+    layout(barmode = "group", yaxis = list(title = "% de personas marcadas"),
+           xaxis = list(title = ""), legend = list(orientation = "h", y = -0.25)) |>
+    tema(340)
+}
+```
+:::
+
+::: {.tarjeta}
+```{r}
+#| output: asis
+tt("Detalle por corrida")
+if (!is.null(registro) && nrow(registro) > 0) {
+  cat("::: {.panel-tabset}\n\n")
+  for (id in registro$run_id) {
+    nom <- registro$nombre[registro$run_id == id]
+    cat("#### ", id, "\n\n", sep = "")
+    cat("**", nom, "** · archivo `", registro$archivo[registro$run_id == id], "` · variables: ",
+        registro$variables[registro$run_id == id], "\n\n", sep = "")
+    for (g in c("dispersion_consenso.png", "coincidencia.png")) {
+      ruta <- file.path("..", "runs", id, "graficos", g)
+      if (file.exists(here("runs", id, "graficos", g))) cat("![](", ruta, "){width=48%} ", sep = "")
+    }
+    cat("\n\n")
+    rm_tab <- leer("runs", id, "tablas", "resumen_metodos.csv")
+    if (!is.null(rm_tab)) cat(knitr::kable(rm_tab, col.names = c("Método", "Marcadas", "% del total")), sep = "\n")
+    cat("\n\n")
+  }
+  cat(":::\n")
+}
+```
+:::
+:::
+:::
+
+```{r}
+#| output: asis
+pk <- c("mclust", "dbscan", "isotree", "tidyverse", "plotly", "DT")
+vs <- sapply(pk, \(p) tryCatch(paste(p, as.character(packageVersion(p))), error = \(e) paste(p, "no instalado")))
+cat('<footer class="pie">Generado el ', format(Sys.time(), "%d/%m/%Y %H:%M"), ' · R ',
+    paste(R.version$major, R.version$minor, sep = "."), ' · ', paste(vs, collapse = " · "), '</footer>', sep = "")
+```
